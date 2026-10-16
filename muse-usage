@@ -76,7 +76,8 @@ def access_token() -> tuple[str, bool]:
     return "", False
   if not isinstance(meta, dict) or not meta:
     return "", False
-  token = str(meta.get("access_token") or "").strip()
+  raw = meta.get("access_token")
+  token = str(raw or "").strip()
   return (token if token.startswith("dca:") else ""), True
 
 
@@ -114,7 +115,7 @@ def reset_iso(value: Any) -> str:
     seconds = float(value)
   except (TypeError, ValueError, OverflowError):
     return ""
-  if not 0 < seconds <= 64092211200:
+  if not 0 < seconds <= 64 * 10**9 + 92_211_200:
     return ""
   return dt.datetime.fromtimestamp(seconds, dt.timezone.utc).isoformat()
 

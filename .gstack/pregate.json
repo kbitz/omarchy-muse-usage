@@ -1,0 +1,12 @@
+{
+  "$schema": "https://github.com/garrytan/gstack/docs/pregate.md#pregate-v1",
+  "strays": {
+    "allow": ["manifest.json", "muse-usage", "Service.qml", ".gstack"]
+  },
+  "dependencies": {
+    "README.md": [],
+    "Service.qml": [],
+    "manifest.json": [],
+    "muse-usage": []
+  }
+}
