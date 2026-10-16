@@ -1,0 +1,409 @@
+#!/usr/bin/python3
+"""Collect Muse usage into one display-ready JSON record.
+
+Writes ~/.local/state/omarchy/agents/usage/muse.json, the same record
+contract the omarchy-agent-usage-<agent> collectors print, so Omarchy's
+Agents panel shows Muse next to Claude Code and Codex without changes.
+
+Token history comes from this machine's session logs in
+~/.local/share/muse/sessions/: each session's JSONL event stream carries
+a model_completed record per finished model call, with the model and its
+token usage. Plan limits come from Meta's account API, the way CodexBar
+reads them: the device-code token `muse login` leaves in
+~/.config/muse/auth.json mints against POST
+https://api.meta.ai/muse-code/key, whose response carries the plan and
+its 5-hour and weekly subscription windows. The history covers this
+machine only; the limits are the account's, like Claude's and Codex's.
+"""
+
+from __future__ import annotations
+
+import datetime as dt
+import json
+import os
+import shutil
+import sys
+import tempfile
+import urllib.request
+from pathlib import Path
+from typing import Any
+
+AGENT_ID = "muse"
+AGENT_NAME = "Muse"
+AUTH_HELP = "Run `muse login` to show Muse limits."
+KEY_ENDPOINT = "https://api.meta.ai/muse-code/key"
+
+HOME = Path.home()
+CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or HOME / ".config")
+DATA_HOME = Path(os.environ.get("XDG_DATA_HOME") or HOME / ".local" / "share")
+STATE_HOME = Path(os.environ.get("XDG_STATE_HOME") or HOME / ".local" / "state")
+CACHE_HOME = Path(os.environ.get("XDG_CACHE_HOME") or HOME / ".cache")
+RECORD = STATE_HOME / "omarchy" / "agents" / "usage" / f"{AGENT_ID}.json"
+CACHE = CACHE_HOME / "omarchy" / "agent-usage" / f"{AGENT_ID}-usage.json"
+
+SESSIONS = DATA_HOME / "muse" / "sessions"
+AUTH_FILE = Path(os.environ.get("MUSE_AUTH_PATH") or CONFIG_HOME / "muse" / "auth.json")
+
+
+def date_string(value: dt.date) -> str:
+  return value.strftime("%Y-%m-%d")
+
+
+def write_json(path: Path, payload: dict[str, Any], compact: bool = False) -> None:
+  path.parent.mkdir(parents=True, exist_ok=True)
+  fd, tmp = tempfile.mkstemp(prefix=f".{path.stem}.", dir=path.parent)
+  try:
+    with os.fdopen(fd, "w") as handle:
+      handle.write(json.dumps(payload, separators=(",", ":") if compact else None, sort_keys=True) + "\n")
+    os.replace(tmp, path)
+  finally:
+    if os.path.exists(tmp):
+      os.unlink(tmp)
+
+
+# --------------------------------------------------------------------- auth
+
+
+# Only the device-code (`dca:`) token from `muse login` can read the
+# quota; dashboard `LLM_` keys and the `LLM|` inference key the CLI mints
+# for itself get a 401 from the key endpoint. The second return value is
+# whether a login is on disk at all, so "never signed in" and "signed in
+# with the wrong kind of credential" can say different things.
+def access_token() -> tuple[str, bool]:
+  try:
+    meta = (json.loads(AUTH_FILE.read_text()).get("providers") or {}).get("meta") or {}
+  except Exception:
+    return "", False
+  if not isinstance(meta, dict) or not meta:
+    return "", False
+  token = str(meta.get("access_token") or "").strip()
+  return (token if token.startswith("dca:") else ""), True
+
+
+# The response also mints a fresh inference key and may carry payment
+# metadata. Both are the CLI's business, not a usage record's: they are
+# dropped here and never written anywhere.
+def request_json(token: str) -> dict[str, Any]:
+  headers = {
+    "x-api-version": "1.0.0",
+    "Content-Type": "application/json",
+    "Accept": "application/json",
+    "User-Agent": "muse-usage",
+  }
+  request = urllib.request.Request(KEY_ENDPOINT, data=b"{}", headers=headers)
+  # A redirected request must never forward the device credential.
+  request.add_unredirected_header("Authorization", f"Bearer {token}")
+  with urllib.request.urlopen(request, timeout=15) as response:
+    return json.loads(response.read().decode("utf-8", errors="replace"))
+
+
+# ------------------------------------------------------------------- limits
+
+
+def percent(value: Any) -> float:
+  try:
+    return max(0.0, min(1.0, float(value) / 100.0))
+  except (TypeError, ValueError, OverflowError):
+    return -1.0
+
+
+# Resets arrive as epoch seconds. An out-of-range one drops the reset
+# time, never the window it belongs to.
+def reset_iso(value: Any) -> str:
+  try:
+    seconds = float(value)
+  except (TypeError, ValueError, OverflowError):
+    return ""
+  if not 0 < seconds <= 64092211200:
+    return ""
+  return dt.datetime.fromtimestamp(seconds, dt.timezone.utc).isoformat()
+
+
+# Window labels are spelled the way Claude's are ("Session (5-hour)",
+# "Weekly (7-day)") because the panel reads the window back out of the
+# label text. A missing subs_usage is not an empty result: Meta omits it
+# while the session window is idle, so the caller keeps its cached limits
+# instead of clearing the bars.
+def subscription_limits(payload: dict[str, Any]) -> list[dict[str, Any]] | None:
+  usage = payload.get("subs_usage")
+  if not isinstance(usage, dict):
+    return None
+  limits = []
+  window = usage.get("window") or {}
+  if isinstance(window, dict):
+    value = percent(window.get("used_percent"))
+    try:
+      minutes = round(float(window.get("window_duration_mins")))
+    except (TypeError, ValueError, OverflowError):
+      minutes = 0
+    if value >= 0 and minutes > 0:
+      label = f"Session ({minutes // 60}-hour)" if minutes % 60 == 0 else f"Session ({minutes}m window)"
+      limits.append({"label": label, "percent": value, "resetsAt": reset_iso(window.get("resets_at"))})
+  weekly = usage.get("weekly") or {}
+  if isinstance(weekly, dict):
+    value = percent(weekly.get("used_percent"))
+    if value >= 0:
+      limits.append({"label": "Weekly (7-day)", "percent": value, "resetsAt": reset_iso(weekly.get("resets_at"))})
+  return limits
+
+
+def reset_open(entry: dict[str, Any], now: dt.datetime) -> bool:
+  try:
+    return dt.datetime.fromisoformat(str(entry.get("resetsAt"))) > now
+  except (TypeError, ValueError):
+    return False
+
+
+# A cached figure outlives the check that measured it only until its
+# window resets, the way the Claude collector treats its cached limits.
+def cached_limits(cache: dict[str, Any]) -> list[dict[str, Any]]:
+  now = dt.datetime.now(dt.timezone.utc)
+  limits = cache.get("limits")
+  if not isinstance(limits, list):
+    return []
+  return [entry for entry in limits if isinstance(entry, dict) and reset_open(entry, now)]
+
+
+# -------------------------------------------------------------------- stats
+
+
+def number(value: Any) -> int:
+  try:
+    return max(0, int(float(value or 0)))
+  except (TypeError, ValueError, OverflowError):
+    return 0
+
+
+# Muse's input_tokens is the whole prompt, cache included, unlike the
+# Claude API convention the other collectors read, where the cache numbers
+# sit next to an uncached-only input. The session logs bear this out: a
+# call with input_tokens 44,960 carries cache_read_tokens 43,636 (the size
+# of the previous call's prompt), and cached_tokens always equals
+# cache_read_tokens. The record's four token fields add up to a total in
+# the other collectors, so report only the uncached remainder as
+# inputTokens and let the cache fields carry the rest; the sum stays
+# input + output, and nothing is counted twice. cache_write_tokens was 0
+# in every local record, but CodexBar's reader validates it as a subset of
+# input_tokens too, so it comes out of the remainder the same way.
+# reasoning_tokens is part of output_tokens on every record checked, so it
+# never gets added.
+def event_tokens(usage: dict[str, Any]) -> dict[str, int]:
+  cache_read = number(usage.get("cache_read_tokens") or usage.get("cached_tokens"))
+  cache_write = number(usage.get("cache_write_tokens"))
+  return {
+    "inputTokens": max(0, number(usage.get("input_tokens")) - cache_read - cache_write),
+    "outputTokens": number(usage.get("output_tokens")),
+    "cacheReadInputTokens": cache_read,
+    "cacheCreationInputTokens": cache_write,
+  }
+
+
+# Only the two inference records carry finished usage: model_completed
+# per model call and automated_review_completed per automated review,
+# both with the same usage shape. The streams also get
+# goal_usage_attribution records restating the same quantities for goal
+# bookkeeping (one sits right before each model_completed locally), so
+# counting those would double every number. The same record can in
+# principle surface again if a log is ever copied or replayed, so dedupe
+# on the record id, falling back to its place in the stream.
+def scan_events() -> list[dict[str, Any]]:
+  events: list[dict[str, Any]] = []
+  seen: set[str] = set()
+  for path in sorted(SESSIONS.glob("**/*.jsonl")):
+    try:
+      handle = path.open(errors="replace")
+    except OSError:
+      continue
+    with handle:
+      try:
+        events.extend(read_events(handle, seen, path))
+      except OSError:
+        continue
+  return events
+
+
+def read_events(lines, seen: set[str], path: Path):
+  for line_number, line in enumerate(lines):
+    if '"model_completed"' not in line and '"automated_review_completed"' not in line:
+      continue
+    try:
+      record = json.loads(line)
+    except ValueError:
+      continue
+    if not isinstance(record, dict):
+      continue
+    payload = record.get("payload")
+    stream = record.get("stream")
+    if not isinstance(payload, dict) or not isinstance(stream, dict):
+      continue
+    event = payload.get("event")
+    if not isinstance(event, dict) or event.get("kind") not in ("model_completed", "automated_review_completed"):
+      continue
+    usage = event.get("usage")
+    if not isinstance(usage, dict):
+      continue
+    session = str(stream.get("id") or "")
+    sequence = record.get("sequence")
+    fallback = f"{session}:{sequence}" if session and sequence is not None else f"{path}:{line_number}"
+    key = str(record.get("id") or "") or fallback
+    if key in seen:
+      continue
+    seen.add(key)
+    yield {
+      "tokens": event_tokens(usage),
+      "stamp": number(record.get("recorded_at")),
+      "model": str(event.get("model") or "unknown"),
+      "session": session,
+    }
+
+
+# One finished model call counts as a prompt, the way the Claude collector
+# counts assistant usage messages and the Cursor plugin counts usage
+# events, so the tabs stay comparable. session-index.db knows the true
+# count of user prompts, but it indexes only root sessions (subagents,
+# which spend tokens too, are missing), keeps no day for each prompt, and
+# trails the live logs; it cannot answer todayPrompts. The event's stream
+# is the session, subagent streams included.
+def usage_stats(events: list[dict[str, Any]]) -> dict[str, Any]:
+  now = dt.datetime.now()
+  today = date_string(now.date())
+  recent_dates = [date_string(now.date() - dt.timedelta(days=offset)) for offset in range(6, -1, -1)]
+  recent = {day: 0 for day in recent_dates}
+  model_usage: dict[str, dict[str, int]] = {}
+  today_by_model: dict[str, int] = {}
+  sessions: set[str] = set()
+  today_sessions: set[str] = set()
+  active_dates: set[str] = set()
+  prompts = today_prompts = 0
+
+  for event in events:
+    tokens = event["tokens"]
+    total = sum(tokens.values())
+    stamp = event["stamp"]
+    if total == 0 or stamp == 0:
+      continue
+    # recorded_at is epoch microseconds.
+    try:
+      day = date_string(dt.datetime.fromtimestamp(stamp / 1_000_000).date())
+    except (ValueError, OverflowError, OSError):
+      continue
+    model = event["model"]
+    session = event["session"]
+
+    prompts += 1
+    active_dates.add(day)
+    if session:
+      sessions.add(session)
+    bucket = model_usage.setdefault(model, dict.fromkeys(tokens, 0))
+    for key, value in tokens.items():
+      bucket[key] += value
+    if day in recent:
+      recent[day] += total
+    if day == today:
+      today_prompts += 1
+      if session:
+        today_sessions.add(session)
+      today_by_model[model] = today_by_model.get(model, 0) + total
+
+  return {
+    "todayPrompts": today_prompts,
+    "todaySessions": len(today_sessions),
+    "todayTotalTokens": sum(today_by_model.values()),
+    "todayTokensByModel": today_by_model,
+    # messageCount carries the day's token total, as in the other collectors.
+    "recentDays": [{"date": day, "messageCount": recent[day]} for day in recent_dates],
+    "totalPrompts": prompts,
+    "totalSessions": len(sessions),
+    "activeDays": len(active_dates),
+    "activeDates": sorted(active_dates),
+    "modelUsage": model_usage,
+  }
+
+
+# ------------------------------------------------------------------- record
+
+
+def collect() -> dict[str, Any]:
+  record: dict[str, Any] = {
+    "schemaVersion": 1,
+    "id": AGENT_ID,
+    "name": AGENT_NAME,
+    "updatedAt": dt.datetime.now(dt.timezone.utc).isoformat(),
+    "hasLocalStats": True,
+    "hasPromptStats": True,
+    # The token history is per-machine, so scope stays "device" and
+    # synced machines add it up. The limits below are the account's;
+    # the panel never merges those.
+    "scope": "device",
+    "tierLabel": "",
+    "usageStatusText": "",
+    "authHelpText": AUTH_HELP,
+    "limits": [],
+  }
+
+  # The last good limits stand in when a check fails, until their window
+  # resets. Auth file metadata binds the cache to the saved sign-in so
+  # switching accounts cannot reuse another account's limits. No credential
+  # or minted key is cached.
+  try:
+    auth_updated_at = AUTH_FILE.stat().st_mtime_ns
+  except OSError:
+    auth_updated_at = None
+  try:
+    cache = json.loads(CACHE.read_text())
+  except Exception:
+    cache = {}
+  if not isinstance(cache, dict) or auth_updated_at is None or cache.get("authUpdatedAt") != auth_updated_at:
+    cache = {}
+  record["limits"] = cached_limits(cache)
+  record["tierLabel"] = str(cache.get("tierLabel") or "")
+
+  token, logged_in = access_token()
+  if not logged_in:
+    record["usageStatusText"] = "Waiting for auth"
+  elif not token:
+    record["usageStatusText"] = "Sign-in expired"
+    record["authHelpText"] = "Muse's saved sign-in has no device-code token. Run `muse login` to refresh it."
+  else:
+    try:
+      payload = request_json(token)
+      record["tierLabel"] = str(payload.get("subs_tier_name") or (record["tierLabel"] if payload.get("is_subs_active") else ""))
+      limits = subscription_limits(payload) if payload.get("is_subs_active") else []
+      if limits is not None:
+        record["limits"] = limits
+        try:
+          write_json(CACHE, {"limits": limits, "tierLabel": record["tierLabel"], "authUpdatedAt": auth_updated_at})
+        except OSError:
+          pass  # A disposable cache must not hide a successful response.
+      if payload.get("require_payment"):
+        record["usageStatusText"] = "Payment required"
+        record["authHelpText"] = "Muse requires a payment method. Finish billing at https://dev.meta.ai"
+    except Exception as error:
+      code = getattr(error, "code", None)
+      if code in (401, 403):
+        record["usageStatusText"] = "Sign-in expired"
+        record["authHelpText"] = "Muse's saved sign-in was rejected. Run `muse login` to refresh it."
+      elif not record["limits"]:
+        record["usageStatusText"] = "Muse limits unavailable"
+        record["authHelpText"] = f"api.meta.ai returned status {code}." if code else "Couldn't reach api.meta.ai."
+
+  record.update(usage_stats(scan_events()))
+  record["ready"] = len(record["limits"]) > 0 or record["totalPrompts"] > 0
+  return record
+
+
+def main() -> int:
+  # If Omarchy ever ships a Muse collector of its own that writes the
+  # same record, step aside rather than overwrite it on every run.
+  if shutil.which("omarchy-agent-usage-muse"):
+    return 0
+  record = collect()
+  if "--print" in sys.argv[1:]:
+    print(json.dumps(record, indent=2, sort_keys=True))
+  else:
+    write_json(RECORD, record, compact=True)
+  return 0
+
+
+if __name__ == "__main__":
+  raise SystemExit(main())

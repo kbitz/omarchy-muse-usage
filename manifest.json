@@ -1,0 +1,13 @@
+{
+  "schemaVersion": 1,
+  "id": "kbitz.muse-usage",
+  "name": "Muse Usage",
+  "version": "1.0.0",
+  "author": "kbitz",
+  "license": "MIT",
+  "description": "Adds Muse usage to the Omarchy Agents panel, next to Claude Code and Codex.",
+  "kinds": ["service"],
+  "entryPoints": {
+    "service": "Service.qml"
+  }
+}
